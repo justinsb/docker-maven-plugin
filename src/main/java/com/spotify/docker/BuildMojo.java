@@ -21,13 +21,12 @@
 
 package com.spotify.docker;
 
-import com.google.common.base.Joiner;
-import com.google.common.base.Splitter;
-import com.google.common.collect.ImmutableList;
+import com.coreos.appc.AppcContainerBuilder;
+import com.coreos.appc.ContainerBuilder;
+import com.coreos.appc.ContainerFile;
+import com.coreos.appc.docker.DockerContainerBuilder;
+import com.coreos.maven.MavenLogAdapter;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Ordering;
-
-import com.spotify.docker.client.AnsiProgressHandler;
 import com.spotify.docker.client.DockerClient;
 import com.spotify.docker.client.DockerException;
 import com.typesafe.config.Config;
@@ -44,7 +43,6 @@ import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 import org.codehaus.plexus.component.configurator.expression.ExpressionEvaluationException;
 import org.codehaus.plexus.util.DirectoryScanner;
-import org.eclipse.jgit.api.errors.GitAPIException;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -52,10 +50,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.attribute.FileTime;
 import java.text.MessageFormat;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -63,14 +58,12 @@ import java.util.TreeSet;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
-import static com.google.common.base.CharMatcher.WHITESPACE;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Ordering.natural;
 import static com.spotify.docker.Utils.parseImageName;
 import static com.spotify.docker.Utils.pushImage;
 import static com.typesafe.config.ConfigRenderOptions.concise;
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Collections.emptyList;
 
 /**
@@ -93,6 +86,12 @@ public class BuildMojo extends AbstractDockerMojo {
    */
   @Parameter(property = "skipDockerBuild", defaultValue = "false")
   private boolean skipDockerBuild;
+
+  /**
+   * The image format to output. Defaults to docker. Use rkt for rkt images.
+   */
+  @Parameter(property = "format", defaultValue = "docker")
+  private String format;
 
   /** Flag to push image after it is built. Defaults to false. */
   @Parameter(property = "pushImage", defaultValue = "false")
@@ -154,7 +153,7 @@ public class BuildMojo extends AbstractDockerMojo {
   @Parameter(property = "dockerImageName")
   private String imageName;
 
-/** Additional tags to tag the image with. */
+  /** Additional tags to tag the image with. */
   @Parameter(property = "dockerImageTags")
   private List<String> imageTags;
 
@@ -191,9 +190,7 @@ public class BuildMojo extends AbstractDockerMojo {
   }
 
   @Override
-  protected void execute(DockerClient docker)
-      throws MojoExecutionException, GitAPIException,
-             IOException, DockerException, InterruptedException {
+  protected void execute(DockerClient docker) throws Exception {
 
     if (skipDockerBuild) {
       getLog().info("Skipping docker build");
@@ -250,17 +247,38 @@ public class BuildMojo extends AbstractDockerMojo {
     mavenProject.getProperties().put("imageName", imageName);
 
     final String destination = Paths.get(buildDirectory, "docker").toString();
+    ContainerBuilder builder;
     if (dockerDirectory == null) {
-      final List<String> copiedPaths = copyResources(destination);
-      createDockerFile(destination, copiedPaths);
+      if (format.equals("rocket") || format.equals("rkt")) {
+        builder = new AppcContainerBuilder(Paths.get(buildDirectory, "image.aci").toFile());
+      } else if (format.equals("docker")) {
+        builder = new DockerContainerBuilder(docker, destination);
+      } else {
+        throw new IllegalStateException("Invalid format: " + format);
+      }
+      builder.log = new MavenLogAdapter(getLog(), getLog().isDebugEnabled());
+      builder.baseImage = baseImage;
+      builder.cmd = cmd;
+      builder.env = env;
+      builder.entryPoint = entryPoint;
+      builder.exposesSet = exposesSet;
+      builder.maintainer = maintainer;
+
+      copyResources(builder);
     } else {
+      DockerContainerBuilder dockerBuilder = new DockerContainerBuilder(docker, destination);
+      dockerBuilder.dockerfile = Paths.get(destination, "Dockerfile");
+
+      builder = dockerBuilder;
+      builder.log = new MavenLogAdapter(getLog(), getLog().isDebugEnabled());
+
       final Resource resource = new Resource();
       resource.setDirectory(dockerDirectory);
       resources.add(resource);
-      copyResources(destination);
+      copyResources(builder);
     }
 
-    buildImage(docker, destination);
+    builder.buildImage(imageName);
     tagImage(docker);
 
     DockerBuildInformation buildInfo = new DockerBuildInformation(imageName, getLog());
@@ -450,92 +468,18 @@ public class BuildMojo extends AbstractDockerMojo {
     }
   }
 
-  private void buildImage(DockerClient docker, String buildDir)
-      throws MojoExecutionException, DockerException, IOException, InterruptedException {
-    getLog().info("Building image " + imageName);
-    docker.build(Paths.get(buildDir), imageName, new AnsiProgressHandler());
-    getLog().info("Built " + imageName);
-  }
-
-  private void tagImage(final DockerClient docker)
-      throws DockerException, InterruptedException, MojoExecutionException {
+  private void tagImage(final DockerClient docker) throws DockerException, InterruptedException,
+      MojoExecutionException {
     final String imageNameWithoutTag = parseImageName(imageName)[0];
     for (final String imageTag : imageTags) {
-      if (!isNullOrEmpty(imageTag)){
+      if (!isNullOrEmpty(imageTag)) {
         getLog().info("Tagging " + imageName + " with " + imageTag);
         docker.tag(imageName, imageNameWithoutTag + ":" + imageTag);
       }
     }
   }
 
-  private void createDockerFile(String directory, List<String> filesToAdd) throws IOException {
-
-    final List<String> commands = newArrayList();
-    if (baseImage != null) {
-      commands.add("FROM " + baseImage);
-    }
-    if (maintainer != null) {
-      commands.add("MAINTAINER " + maintainer);
-    }
-    if (entryPoint != null) {
-      commands.add("ENTRYPOINT " + entryPoint);
-    }
-    if (cmd != null) {
-      // TODO(dano): we actually need to check whether the base image has an entrypoint
-      if (entryPoint != null) {
-        // CMD needs to be a list of arguments if ENTRYPOINT is set.
-        if (cmd.startsWith("[") && cmd.endsWith("]")) {
-          // cmd seems to be an argument list, so we're good
-          commands.add("CMD " + cmd);
-        } else {
-          // cmd does not seem to be an argument list, so try to generate one.
-          final List<String> args = ImmutableList.copyOf(
-              Splitter.on(WHITESPACE).omitEmptyStrings().split(cmd));
-          final StringBuilder cmdBuilder = new StringBuilder("[");
-          for (String arg : args) {
-            cmdBuilder.append('"').append(arg).append('"');
-          }
-          cmdBuilder.append(']');
-          final String cmdString = cmdBuilder.toString();
-          commands.add("CMD " + cmdString);
-          getLog().warn("Entrypoint provided but cmd is not an explicit list. Attempting to " +
-                        "generate CMD string in the form of an argument list.");
-          getLog().warn("CMD " + cmdString);
-        }
-      } else {
-        // no ENTRYPOINT set so use cmd verbatim
-        commands.add("CMD " + cmd);
-      }
-    } else {
-      commands.add("CMD []");
-    }
-
-    for (String file : filesToAdd) {
-      commands.add(String.format("ADD %s %s", file, file));
-    }
-
-    if (env != null) {
-      final List<String> sortedKeys = Ordering.natural().sortedCopy(env.keySet());
-      for (String key : sortedKeys) {
-        final String value = env.get(key);
-        commands.add(String.format("ENV %s %s", key, value));
-      }
-    }
-
-    if (exposesSet.size() > 0) {
-      // The values will be sorted with no duplicated since exposesSet is a TreeSet
-      commands.add("EXPOSE " + Joiner.on(" ").join(exposesSet));
-    }
-
-    // this will overwrite an existing file
-    Files.createDirectories(Paths.get(directory));
-    Files.write(Paths.get(directory, "Dockerfile"), commands, UTF_8);
-  }
-
-  private List<String> copyResources(String destination) throws IOException {
-
-    final List<String> allCopiedPaths = newArrayList();
-
+  private void copyResources(ContainerBuilder builder) throws IOException {
     for (Resource resource : resources) {
       final File source = new File(resource.getDirectory());
       final List<String> includes = resource.getIncludes();
@@ -555,20 +499,17 @@ public class BuildMojo extends AbstractDockerMojo {
         getLog().info("No resources will be copied, no files match specified patterns");
       }
 
-      final List<String> copiedPaths = newArrayList();
-
+      final List<ContainerFile> containerFiles = newArrayList();
       for (String included : scanner.getIncludedFiles()) {
         final Path sourcePath = Paths.get(resource.getDirectory(), included);
-        final String targetPath = resource.getTargetPath() == null ? "" : resource.getTargetPath();
-        final Path destPath = Paths.get(destination, targetPath, included);
-        getLog().info(String.format("Copying %s -> %s", sourcePath, destPath));
-        // ensure all directories exist because copy operation will fail if they don't
-        Files.createDirectories(destPath.getParent());
-        Files.copy(sourcePath, destPath, StandardCopyOption.REPLACE_EXISTING);
-        Files.setLastModifiedTime(destPath, FileTime.fromMillis(0));
-        // file location relative to docker directory, used later to generate Dockerfile
-        final Path relativePath = Paths.get(targetPath, included);
-        copiedPaths.add(relativePath.toString());
+        String targetPath = resource.getTargetPath() == null ? "" : resource.getTargetPath();
+        if (!targetPath.isEmpty() && !targetPath.endsWith(File.separator)) {
+          targetPath += File.separator;
+        }
+        final String imagePath = targetPath + included;
+
+        ContainerFile containerFile = new ContainerFile(sourcePath, imagePath);
+        containerFiles.add(containerFile);
       }
 
       // The list of included files returned from DirectoryScanner can be in a different order
@@ -578,10 +519,7 @@ public class BuildMojo extends AbstractDockerMojo {
       // before adding it to the allCopiedPaths list. This way we follow the ordering of the
       // resources in the pom, while making sure all the paths of each resource are always in the
       // same order.
-      Collections.sort(copiedPaths);
-      allCopiedPaths.addAll(copiedPaths);
+      builder.addFiles(containerFiles);
     }
-
-    return allCopiedPaths;
   }
 }
