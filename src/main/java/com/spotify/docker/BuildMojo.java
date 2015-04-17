@@ -21,11 +21,18 @@
 
 package com.spotify.docker;
 
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.coreos.appc.AciImageInfo;
+import com.coreos.appc.AciRepository;
 import com.coreos.appc.AppcContainerBuilder;
 import com.coreos.appc.ContainerBuilder;
 import com.coreos.appc.ContainerFile;
+import com.coreos.appc.S3AciRepository;
 import com.coreos.appc.docker.DockerContainerBuilder;
 import com.coreos.maven.MavenLogAdapter;
+import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.spotify.docker.client.DockerClient;
 import com.spotify.docker.client.DockerException;
@@ -43,10 +50,12 @@ import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 import org.codehaus.plexus.component.configurator.expression.ExpressionEvaluationException;
 import org.codehaus.plexus.util.DirectoryScanner;
+import org.slf4j.Logger;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -92,6 +101,13 @@ public class BuildMojo extends AbstractDockerMojo {
    */
   @Parameter(property = "format", defaultValue = "docker")
   private String format;
+
+  /**
+   * The image repository to push to.
+   * Must be set for a push.
+   */
+  @Parameter(property = "repository")
+  private String repository;
 
   /** Flag to push image after it is built. Defaults to false. */
   @Parameter(property = "pushImage", defaultValue = "false")
@@ -247,16 +263,20 @@ public class BuildMojo extends AbstractDockerMojo {
     mavenProject.getProperties().put("imageName", imageName);
 
     final String destination = Paths.get(buildDirectory, "docker").toString();
+
+    File imageFile = null;
+
     ContainerBuilder builder;
     if (dockerDirectory == null) {
       if (format.equals("rocket") || format.equals("rkt")) {
-        builder = new AppcContainerBuilder(Paths.get(buildDirectory, "image.aci").toFile());
+        imageFile = Paths.get(buildDirectory, "image.aci").toFile();
+        builder = new AppcContainerBuilder(imageFile);
       } else if (format.equals("docker")) {
         builder = new DockerContainerBuilder(docker, destination);
       } else {
         throw new IllegalStateException("Invalid format: " + format);
       }
-      builder.log = new MavenLogAdapter(getLog(), getLog().isDebugEnabled());
+      builder.log = getSlf4jLogger();
       builder.baseImage = baseImage;
       builder.cmd = cmd;
       builder.env = env;
@@ -294,8 +314,38 @@ public class BuildMojo extends AbstractDockerMojo {
     }
 
     if (pushImage) {
-      pushImage(docker, imageName, getLog());
+      if (builder instanceof DockerContainerBuilder) {
+        pushImage(docker, imageName, getLog());
+      } else if (builder instanceof AppcContainerBuilder) {
+        AciRepository aciRepository = getAciRepository();
+        AciImageInfo imageInfo = new AciImageInfo();
+        imageInfo.name = imageName;
+        aciRepository.push(imageInfo, imageFile, getSlf4jLogger());
+      } else {
+        throw new IllegalStateException();
+      }
     }
+  }
+
+  private AciRepository getAciRepository() throws MojoExecutionException {
+    if (Strings.isNullOrEmpty(this.repository)) {
+      throw new MojoExecutionException("Must set repository to push to");
+    }
+    URI uri = URI.create(this.repository);
+    String scheme = uri.getScheme();
+    if (scheme.equals("s3")) {
+      AWSCredentialsProvider provider = new DefaultAWSCredentialsProviderChain();
+      AmazonS3Client amazonS3Client = new AmazonS3Client(provider);
+      String bucketName = uri.getHost();
+      String prefix = uri.getPath();
+      return new S3AciRepository(amazonS3Client, bucketName, prefix);
+    } else {
+      throw new MojoExecutionException("Unknown repository scheme: " + scheme);
+    }
+  }
+
+  private Logger getSlf4jLogger() {
+    return new MavenLogAdapter(getLog(), getLog().isDebugEnabled());
   }
 
   private File createImageArtifact(Artifact mainArtifact, DockerBuildInformation buildInfo)
