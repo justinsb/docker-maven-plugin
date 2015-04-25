@@ -150,7 +150,7 @@ public class DockerContainerBuilder extends ContainerBuilder {
     addFiles.addAll(copiedPaths);
   }
 
-  public void buildImage(String imageName) throws Exception {
+  public void buildImage(String imageName, String imageVersion) throws Exception {
     if (dockerfile == null) {
       createDockerFile();
     }

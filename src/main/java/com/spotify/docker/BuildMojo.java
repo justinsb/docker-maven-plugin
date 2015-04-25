@@ -26,9 +26,11 @@ import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.services.s3.AmazonS3Client;
 import com.coreos.appc.AciImageInfo;
 import com.coreos.appc.AciRepository;
+import com.coreos.appc.AciSigner;
 import com.coreos.appc.AppcContainerBuilder;
 import com.coreos.appc.ContainerBuilder;
 import com.coreos.appc.ContainerFile;
+import com.coreos.appc.GpgCommandAciSigner;
 import com.coreos.appc.S3AciRepository;
 import com.coreos.appc.docker.DockerContainerBuilder;
 import com.coreos.maven.MavenLogAdapter;
@@ -113,6 +115,10 @@ public class BuildMojo extends AbstractDockerMojo {
   @Parameter(property = "pushImage", defaultValue = "false")
   private boolean pushImage;
 
+  /** Flag to sign image after it is built. Defaults to true. */
+  @Parameter(property = "signImage", defaultValue = "true")
+  private boolean signImage;
+
   /** The maintainer of the image. Ignored if dockerDirectory is set. */
   @Parameter(property = "dockerMaintainer")
   private String maintainer;
@@ -150,8 +156,8 @@ public class BuildMojo extends AbstractDockerMojo {
    * changes not yet committed, the string '.DIRTY' will be appended to the end. Note, if a tag is
    * explicitly specified in the <tt>newName</tt> parameter, this flag will be ignored.
    */
-  @Parameter(property = "useGitCommitId", defaultValue = "false")
-  private boolean useGitCommitId;
+//  @Parameter(property = "useGitCommitId", defaultValue = "false")
+//  private boolean useGitCommitId;
 
   /**
    * Resources to include in the build. Specify resources by using the standard resource elements as
@@ -166,7 +172,7 @@ public class BuildMojo extends AbstractDockerMojo {
   private List<Resource> resources;
 
   /** Built image will be given this name. */
-  @Parameter(property = "dockerImageName")
+  @Parameter(property = "imageName")
   private String imageName;
 
   /** Additional tags to tag the image with. */
@@ -242,14 +248,18 @@ public class BuildMojo extends AbstractDockerMojo {
         baseImage = expand(baseImage);
       }
     }
+    */
 
     loadProfile();
     validateParameters();
 
+    /*
     final String[] repoTag = parseImageName(imageName);
     final String repo = repoTag[0];
     final String tag = repoTag[1];
+    */
 
+    /*
     if (useGitCommitId) {
       if (tag != null) {
         getLog().warn("Ignoring useGitCommitId flag because tag is explicitly set in image name ");
@@ -260,6 +270,8 @@ public class BuildMojo extends AbstractDockerMojo {
         imageName = repo + ":" + commitId;
       }
     }
+    */
+
     mavenProject.getProperties().put("imageName", imageName);
 
     final String destination = Paths.get(buildDirectory, "docker").toString();
@@ -298,7 +310,9 @@ public class BuildMojo extends AbstractDockerMojo {
       copyResources(builder);
     }
 
-    builder.buildImage(imageName);
+    String imageVersion = mavenProject.getVersion();
+
+    builder.buildImage(imageName, imageVersion);
     tagImage(docker);
 
     DockerBuildInformation buildInfo = new DockerBuildInformation(imageName, getLog());
@@ -320,7 +334,15 @@ public class BuildMojo extends AbstractDockerMojo {
         AciRepository aciRepository = getAciRepository();
         AciImageInfo imageInfo = new AciImageInfo();
         imageInfo.name = imageName;
-        aciRepository.push(imageInfo, imageFile, getSlf4jLogger());
+        imageInfo.version = imageVersion;
+
+        byte[] signature = null;
+        if (signImage) {
+          AciSigner signer = new GpgCommandAciSigner();
+          signature = signer.sign(imageFile);
+        }
+
+        aciRepository.push(imageInfo, imageFile, signature, getSlf4jLogger());
       } else {
         throw new IllegalStateException();
       }
